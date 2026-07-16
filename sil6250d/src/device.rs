@@ -15,6 +15,11 @@ const MIN_OVERLAP: i32 = 1200;
 const ENROLL_MAX_NCC: f32 = 0.85;
 const ENROLL_MAX_REDUNDANT: u32 = ENROLL_STAGES * 4;
 const QUALITY_MIN: f32 = 0.52;
+// A run of unreadable presses means the sensor sees a finger but cannot get a
+// clean image of it (dry skin, a light or partial press, a smudged platen).
+// Retrying forever leaves the client with nothing to show, so give up after this
+// many and report a terminal no-match instead.
+const POOR_SCAN_MAX: u32 = 3;
 const SIFT_THRESHOLD: i32 = 5;
 
 pub const OBJECT_PATH: &str = "/io/github/uunicorn/Fprint/Device";
@@ -324,7 +329,11 @@ fn verify_blocking(
     // Canonical press-sensor loop: one finger presentation per round. A poor or
     // unusable scan is reported as a non-terminal "verify-retry-scan" so the user
     // simply re-presses with no penalty and no client round-trip; only a
-    // good-quality capture yields a match / no-match decision.
+    // good-quality capture yields a match / no-match decision. After
+    // POOR_SCAN_MAX consecutive poor scans the round ends in a no-match so the
+    // client can surface a failure rather than waiting on a signal it may not
+    // render.
+    let mut poor_scans: u32 = 0;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
@@ -339,7 +348,20 @@ fn verify_blocking(
 
         let q = frame.quality();
         if q < QUALITY_MIN {
-            tracing::debug!(q, quality_min = QUALITY_MIN, "verify: poor scan, retry");
+            poor_scans += 1;
+            tracing::debug!(
+                q,
+                quality_min = QUALITY_MIN,
+                poor_scans,
+                "verify: poor scan, retry"
+            );
+            if poor_scans >= POOR_SCAN_MAX {
+                tracing::debug!(
+                    poor_scans,
+                    "verify: too many poor scans, reporting no-match"
+                );
+                return Ok(false);
+            }
             let em = emitter.clone();
             rt.block_on(async move {
                 let _ = DeviceService::verify_status(&em, "verify-retry-scan", false).await;
