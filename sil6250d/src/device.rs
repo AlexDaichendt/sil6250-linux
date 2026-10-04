@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, MutexGuard, Notify};
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::engine::{Engine, Features, Frame};
@@ -36,6 +36,29 @@ pub struct DeviceService {
     resume_notify: Arc<Notify>,
 }
 
+#[derive(Clone)]
+struct Operation {
+    cancelled: Arc<AtomicBool>,
+    current: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl Operation {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    async fn lock_current(&self) -> Option<MutexGuard<'_, Option<Arc<AtomicBool>>>> {
+        let current = self.current.lock().await;
+        if self.is_cancelled()
+            || !current.as_ref().is_some_and(|token| Arc::ptr_eq(token, &self.cancelled))
+        {
+            return None;
+        }
+        // Serialize publication and storage with cancellation and replacement.
+        Some(current)
+    }
+}
+
 impl DeviceService {
     pub fn new(devpath: String) -> Self {
         DeviceService {
@@ -47,27 +70,18 @@ impl DeviceService {
         }
     }
 
-    /// Cancel whatever is running and hand out a fresh flag for the operation
-    /// that is about to start.
-    ///
-    /// Every operation gets its OWN flag. A single shared flag meant a new
-    /// verify cleared the very flag the previous, still running, blocking
-    /// thread was watching, so that thread never observed its cancellation and
-    /// kept driving the sensor underneath its replacement.
-    async fn begin_op(&self) -> Arc<AtomicBool> {
+    async fn begin_op(&self) -> Operation {
         let mut current = self.current.lock().await;
-
         if let Some(previous) = current.take() {
             previous.store(true, Ordering::Relaxed);
         }
-
-        let token = Arc::new(AtomicBool::new(false));
-        *current = Some(Arc::clone(&token));
-        token
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *current = Some(Arc::clone(&cancelled));
+        Operation { cancelled, current: Arc::clone(&self.current) }
     }
 
     async fn cancel_current(&self) {
-        if let Some(current) = self.current.lock().await.as_ref() {
+        if let Some(current) = self.current.lock().await.take() {
             current.store(true, Ordering::Relaxed);
         }
     }
@@ -109,7 +123,7 @@ impl DeviceService {
             return Err(zbus::fdo::Error::Failed("suspended".into()));
         }
 
-        let cancelled = self.begin_op().await;
+        let operation = self.begin_op().await;
         let dev_lock = Arc::clone(&self.dev_lock);
 
         let devpath = self.devpath.clone();
@@ -122,17 +136,17 @@ impl DeviceService {
                 // Wait for any previous engine to let go of the sensor.
                 let _device = dev_lock.lock().await;
 
-                if cancelled.load(Ordering::Relaxed) {
+                if operation.is_cancelled() {
                     tracing::debug!("enroll superseded before it reached the sensor");
                     ("enroll-failed", true)
                 } else {
                     let result = tokio::task::spawn_blocking({
-                        let cancelled = Arc::clone(&cancelled);
+                        let operation = operation.clone();
                         let emitter = emitter.clone();
                         let username = username.clone();
                         let finger_name = finger_name.clone();
                         move || {
-                            enroll_blocking(&devpath, &username, &finger_name, &cancelled, emitter)
+                            enroll_blocking(&devpath, &username, &finger_name, &operation, emitter)
                         }
                     })
                     .await;
@@ -151,7 +165,10 @@ impl DeviceService {
                 }
             };
 
-            let _ = DeviceService::enroll_status(&emitter, status, done).await;
+            if let Some(mut current) = operation.lock_current().await {
+                let _ = DeviceService::enroll_status(&emitter, status, done).await;
+                *current = None;
+            };
         });
 
         Ok(())
@@ -168,7 +185,7 @@ impl DeviceService {
         username: &str,
         finger_name: &str,
     ) -> zbus::fdo::Result<()> {
-        let cancelled = self.begin_op().await;
+        let operation = self.begin_op().await;
         let dev_lock = Arc::clone(&self.dev_lock);
 
         let devpath = self.devpath.clone();
@@ -185,19 +202,19 @@ impl DeviceService {
                 // Wait for any previous engine to let go of the sensor.
                 let _device = dev_lock.lock().await;
 
-                if cancelled.load(Ordering::Relaxed) {
+                if operation.is_cancelled() {
                     // A newer verify owns the sensor now; opening a second
                     // engine here is what used to wedge the handshake.
                     tracing::debug!("verify superseded before it reached the sensor");
                     ("verify-no-match", true)
                 } else {
                     let result = tokio::task::spawn_blocking({
-                        let cancelled = Arc::clone(&cancelled);
+                        let operation = operation.clone();
                         let emitter = emitter.clone();
                         let username = username.clone();
                         let finger_name = finger_name.clone();
                         move || {
-                            verify_blocking(&devpath, &username, &finger_name, &cancelled, emitter)
+                            verify_blocking(&devpath, &username, &finger_name, &operation, emitter)
                         }
                     })
                     .await;
@@ -217,7 +234,10 @@ impl DeviceService {
                 }
             };
 
-            let _ = DeviceService::verify_status(&emitter, status, done).await;
+            if let Some(mut current) = operation.lock_current().await {
+                let _ = DeviceService::verify_status(&emitter, status, done).await;
+                *current = None;
+            };
         });
 
         Ok(())
@@ -271,7 +291,7 @@ fn enroll_blocking(
     devpath: &str,
     username: &str,
     finger_name: &str,
-    cancelled: &AtomicBool,
+    operation: &Operation,
     emitter: SignalEmitter<'_>,
 ) -> anyhow::Result<()> {
     let mut engine = Engine::open(devpath)?;
@@ -283,7 +303,7 @@ fn enroll_blocking(
     let mut redundant: u32 = 0;
 
     while got < ENROLL_STAGES {
-        if cancelled.load(Ordering::Relaxed) {
+        if operation.is_cancelled() {
             anyhow::bail!("cancelled");
         }
 
@@ -296,12 +316,17 @@ fn enroll_blocking(
 
         // Reject poor scans outright: a weak frame pollutes the gallery and
         // drags down genuine match scores. Ask the user to present again.
+        if operation.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
         let q = frame.quality();
         if q < QUALITY_MIN {
             tracing::debug!(q, quality_min = QUALITY_MIN, "enroll: poor scan, retry");
             let em = emitter.clone();
             rt.block_on(async move {
-                let _ = DeviceService::enroll_status(&em, "enroll-retry-scan", false).await;
+                if let Some(_current) = operation.lock_current().await {
+                    let _ = DeviceService::enroll_status(&em, "enroll-retry-scan", false).await;
+                }
             });
             redundant += 1;
             if redundant >= ENROLL_MAX_REDUNDANT {
@@ -326,7 +351,9 @@ fn enroll_blocking(
             got += 1;
             let em = emitter.clone();
             rt.block_on(async move {
-                let _ = DeviceService::enroll_status(&em, "enroll-stage-passed", false).await;
+                if let Some(_current) = operation.lock_current().await {
+                    let _ = DeviceService::enroll_status(&em, "enroll-stage-passed", false).await;
+                }
             });
         }
 
@@ -341,7 +368,12 @@ fn enroll_blocking(
 
     let kp_counts: Vec<usize> = kept_features.iter().map(|f| f.kp.len()).collect();
     tracing::debug!(stages = got, ?kp_counts, "enroll complete");
-    storage::save_features(username, finger_name, &kept_features)?;
+    rt.block_on(async {
+        let _current = operation.lock_current().await
+            .ok_or_else(|| anyhow::anyhow!("cancelled"))?;
+        storage::save_features(username, finger_name, &kept_features)
+            .map_err(anyhow::Error::from)
+    })?;
     Ok(())
 }
 
@@ -349,7 +381,7 @@ fn verify_blocking(
     devpath: &str,
     username: &str,
     finger_name: &str,
-    cancelled: &AtomicBool,
+    operation: &Operation,
     emitter: SignalEmitter<'_>,
 ) -> anyhow::Result<bool> {
     // fprintd uses the sentinel finger "any" to mean "match against any
@@ -376,7 +408,7 @@ fn verify_blocking(
     // simply re-presses with no penalty and no client round-trip; only a
     // good-quality capture yields a match / no-match decision.
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if operation.is_cancelled() {
             anyhow::bail!("cancelled");
         }
 
@@ -387,12 +419,17 @@ fn verify_blocking(
             continue;
         };
 
+        if operation.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
         let q = frame.quality();
         if q < QUALITY_MIN {
             tracing::debug!(q, quality_min = QUALITY_MIN, "verify: poor scan, retry");
             let em = emitter.clone();
             rt.block_on(async move {
-                let _ = DeviceService::verify_status(&em, "verify-retry-scan", false).await;
+                if let Some(_current) = operation.lock_current().await {
+                    let _ = DeviceService::verify_status(&em, "verify-retry-scan", false).await;
+                }
             });
             engine.wait_finger_up(LIFT_MS);
             continue;
@@ -413,6 +450,47 @@ fn verify_blocking(
             );
         }
         tracing::debug!(score, q, threshold = SIFT_THRESHOLD, "verify result");
+        if operation.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
         return Ok(score >= SIFT_THRESHOLD);
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_operation_cannot_publish() {
+        let service = DeviceService::new(String::new());
+        let operation = service.begin_op().await;
+        service.cancel_current().await;
+        assert!(operation.is_cancelled());
+        assert!(operation.lock_current().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn replaced_operation_cannot_publish() {
+        let service = DeviceService::new(String::new());
+        let previous = service.begin_op().await;
+        let current = service.begin_op().await;
+        assert!(previous.is_cancelled());
+        assert!(previous.lock_current().await.is_none());
+        assert!(current.lock_current().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_in_flight_publication() {
+        let service = DeviceService::new(String::new());
+        let operation = service.begin_op().await;
+        let publication = operation.lock_current().await.unwrap();
+        let cancellation = service.cancel_current();
+        tokio::pin!(cancellation);
+        assert!(futures_util::poll!(cancellation.as_mut()).is_pending());
+        assert!(!operation.is_cancelled());
+        drop(publication);
+        cancellation.await;
+        assert!(operation.lock_current().await.is_none());
     }
 }
