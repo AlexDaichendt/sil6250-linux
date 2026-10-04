@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
     register_with_manager(&conn).await?;
 
-    tracing::info!("registered with open-fprintd manager; running");
+    tracing::info!("running; monitoring open-fprintd manager");
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -53,11 +53,9 @@ async fn register_with_manager(conn: &zbus::Connection) -> anyhow::Result<()> {
     let proxy = zbus::fdo::DBusProxy::new(conn).await?;
     let mut name_owner_changed = proxy.receive_name_owner_changed().await?;
 
-    if try_register(conn).await.is_ok() {
-        return Ok(());
+    if let Err(e) = try_register(conn).await {
+        tracing::info!("initial registration failed; waiting for open-fprintd: {e}");
     }
-
-    tracing::info!("open-fprintd manager not yet present; waiting for it to appear");
 
     tokio::spawn({
         let conn = conn.clone();
@@ -92,4 +90,56 @@ async fn try_register(conn: &zbus::Connection) -> anyhow::Result<()> {
 
     tracing::info!("device registered at {OBJECT_PATH}");
     Ok(())
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::time::Duration;
+
+    struct Manager(Arc<AtomicUsize>);
+
+    #[zbus::interface(name = "net.reactivated.Fprint.Manager")]
+    impl Manager {
+        fn register_device(&self, path: &str) {
+            assert_eq!(path, OBJECT_PATH);
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while calls.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("manager did not receive registration");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated bus: dbus-run-session -- cargo test -p sil6250d -- --ignored"]
+    async fn registers_after_manager_appears_and_restarts() {
+        let early_backend = zbus::Connection::session().await.unwrap();
+        register_with_manager(&early_backend).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = Builder::session().unwrap()
+            .name(MANAGER_DEST).unwrap()
+            .serve_at(MANAGER_PATH, Manager(calls.clone())).unwrap()
+            .build().await.unwrap();
+        wait_for_calls(&calls, 1).await;
+
+        let late_backend = zbus::Connection::session().await.unwrap();
+        register_with_manager(&late_backend).await.unwrap();
+        wait_for_calls(&calls, 2).await;
+
+        manager.release_name(MANAGER_DEST).await.unwrap();
+        let new_calls = Arc::new(AtomicUsize::new(0));
+        let replacement = Builder::session().unwrap()
+            .name(MANAGER_DEST).unwrap()
+            .serve_at(MANAGER_PATH, Manager(new_calls.clone())).unwrap()
+            .build().await.unwrap();
+        wait_for_calls(&new_calls, 2).await;
+        replacement.release_name(MANAGER_DEST).await.unwrap();
+    }
 }
