@@ -16,6 +16,7 @@ depends=('dkms')
 makedepends=('git')
 provides=("${_pkgbase}-dkms=${pkgver}")
 conflicts=("${_pkgbase}-dkms")
+install=sil6250-dkms.install
 source=("git+https://github.com/AlexDaichendt/sil6250-linux.git")
 sha256sums=('SKIP')
 
@@ -42,8 +43,7 @@ package() {
   sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${pkgver}\"/" \
     kernel/dkms.conf > "${dest}/dkms.conf"
 
-  # udev rule: ACL the active session onto /dev/sil6250 (no sudo needed) and a
-  # 0660 root:users fallback for system services such as fprintd/sil6250d.
-  install -Dm644 kernel/60-sil6250.rules \
-    "${pkgdir}/usr/lib/udev/rules.d/60-sil6250.rules"
+  # Keep raw mailbox and GPIO access restricted to the root-owned daemon.
+  install -Dm644 kernel/69-sil6250.rules \
+    "${pkgdir}/usr/lib/udev/rules.d/69-sil6250.rules"
 }

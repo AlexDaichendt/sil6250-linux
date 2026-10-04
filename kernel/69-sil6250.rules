@@ -1,0 +1,11 @@
+# sil6250d is the only process that needs direct mailbox and GPIO access.
+# Do not expose this low-level device to interactive sessions.
+# The 69- prefix overrides the legacy 60- rule before 73-seat-late applies
+# uaccess ACLs.
+#
+# Install:
+#   sudo cp 69-sil6250.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger -s misc        # or replug / reload the module
+
+SUBSYSTEM=="misc", KERNEL=="sil6250", TAG-="uaccess", MODE="0600", OWNER="root", GROUP="root"

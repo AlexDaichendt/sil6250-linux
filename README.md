@@ -54,10 +54,27 @@ tracked and uninstallable with `pacman -R sil6250d sil6250-dkms`. These are VCS
 
 ### Other distros: `install.sh`
 
+Use an up-to-date stable Rust toolchain to build the daemon. The compiler
+packaged by your distribution may be too old for the locked dependencies;
+[rustup](https://rust-lang.org/tools/install/) is the recommended way to obtain
+a current toolchain. Run Cargo as your regular user; `install.sh` requests
+root privileges for system installation steps.
+
 ```sh
 git clone https://github.com/AlexDaichendt/sil6250-linux.git
 cd sil6250-linux
+```
 
+If using rustup, select the stable toolchain for this checkout:
+
+```sh
+rustup toolchain install stable
+rustup override set stable
+```
+
+Build and install using the committed dependency versions in `Cargo.lock`:
+
+```sh
 # build + install everything (kernel module, sil6250d daemon)
 # Tested on CachyOS and Omarchy - in case it fails, you can easily install the components by hand.
 # Check the install.sh script what it is copying where.

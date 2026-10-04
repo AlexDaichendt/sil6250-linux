@@ -104,6 +104,20 @@ impl Features {
                 desc[i] = f32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
                 off += 4;
             }
+            if !x.is_finite()
+                || !y.is_finite()
+                || !scale.is_finite()
+                || !ori.is_finite()
+                || !resp.is_finite()
+                || !(0.0..PM_W as f32).contains(&x)
+                || !(0.0..PM_H as f32).contains(&y)
+                || scale <= 0.0
+                || !(-std::f32::consts::TAU..=std::f32::consts::TAU).contains(&ori)
+                || desc.iter().any(|v| !v.is_finite())
+            {
+                return None;
+            }
+            let ori = ori.rem_euclid(std::f32::consts::TAU);
             kp.push(Keypoint {
                 x,
                 y,
@@ -114,6 +128,47 @@ impl Features {
             });
         }
         Some(Features { kp })
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_finite_feature_values() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SILF");
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&f32::NAN.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; DESC_DIM * 4]);
+        assert!(Features::deserialize(&bytes).is_none());
+    }
+
+    #[test]
+    fn rejects_extreme_finite_orientation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SILF");
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&1e30f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; DESC_DIM * 4]);
+        assert!(Features::deserialize(&bytes).is_none());
+    }
+
+    #[test]
+    fn wraps_extreme_finite_angles_without_looping() {
+        let wrapped = ang_wrap(1e30);
+        assert!((-PI..=PI).contains(&wrapped));
     }
 }
 
@@ -346,7 +401,7 @@ fn compute_descriptor(gx: &[f32; PM_N], gy: &[f32; PM_N], kp: &mut Keypoint) {
     let cell = PS_MAGFAC * kp.scale;
     let ct = kp.ori.cos();
     let st = kp.ori.sin();
-    let radius = (cell * (PS_D as f32 + 1.0) * 0.5 * 1.41421356 + 0.5) as i32;
+    let radius = (cell * (PS_D as f32 + 1.0) * 0.5 * std::f32::consts::SQRT_2 + 0.5) as i32;
     let xi = (kp.x + 0.5) as i32;
     let yi = (kp.y + 0.5) as i32;
     let expden = 2.0 * (0.5 * PS_D as f32).powi(2);
@@ -526,14 +581,8 @@ fn desc_dist2(a: &[f32; DESC_DIM], b: &[f32; DESC_DIM]) -> f32 {
     a.iter().zip(b.iter()).map(|(&ai, &bi)| (ai - bi) * (ai - bi)).sum()
 }
 
-fn ang_wrap(mut a: f32) -> f32 {
-    while a > PI {
-        a -= 2.0 * PI;
-    }
-    while a < -PI {
-        a += 2.0 * PI;
-    }
-    a
+fn ang_wrap(a: f32) -> f32 {
+    (a + PI).rem_euclid(std::f32::consts::TAU) - PI
 }
 
 #[derive(Clone, Copy)]

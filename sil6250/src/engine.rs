@@ -4,7 +4,7 @@
 use std::io::{self, Read, Write};
 use std::ptr::NonNull;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openssl::ssl::{HandshakeError, Ssl, SslContext, SslContextBuilder, SslMethod, SslStream,
                    SslVerifyMode, SslVersion};
@@ -74,6 +74,8 @@ const IMG_BULK0_LEN: u32 = 3109;
 const IMG_BULK0_RETRIES: u32 = 6;
 const IMG_CONT_RETRIES: u32 = 8;
 const CAPTURE_ATTEMPTS: u32 = 6;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const HANDSHAKE_MAX_WOULD_BLOCKS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -98,6 +100,7 @@ struct EngineShared {
     hs_leftover: [u8; 512],
     hs_leftover_len: usize,
     hs_leftover_off: usize,
+    handshake_deadline: Option<Instant>,
     session_key: usize,
 }
 
@@ -141,9 +144,10 @@ impl Read for TransportBio {
 
         // Read into a local buffer first to avoid borrowing e.hs_leftover
         // and &mut e simultaneously.
+        let deadline = e.handshake_deadline;
         for _ in 0..12 {
             let mut tmp = [0u8; 512];
-            let got = read_chunk(&mut e.dev, &mut tmp)?;
+            let got = read_chunk(&mut e.dev, &mut tmp, deadline)?;
             if got > 0 {
                 e.hs_leftover[..got].copy_from_slice(&tmp[..got]);
                 e.hs_leftover_len = got;
@@ -160,7 +164,7 @@ impl Read for TransportBio {
 impl Write for TransportBio {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let e = unsafe { self.0.as_mut() };
-        bio_send(&mut e.dev, buf)?;
+        bio_send(&mut e.dev, buf, e.handshake_deadline)?;
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -170,7 +174,22 @@ impl Write for TransportBio {
 
 // ---- low-level transport helpers -------------------------------------------
 
-fn write_chunk(dev: &mut PetaicDev, data: &[u8]) -> io::Result<()> {
+fn bounded_timeout(deadline: Option<Instant>, default_ms: u32) -> io::Result<u32> {
+    let Some(deadline) = deadline else {
+        return Ok(default_ms);
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+    let remaining_ms = remaining.as_millis().max(1).min(u32::MAX as u128) as u32;
+    Ok(default_ms.min(remaining_ms))
+}
+
+fn write_chunk(
+    dev: &mut PetaicDev,
+    data: &[u8],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     if data.is_empty() || data.len() > 255 {
         return Err(io::Error::from_raw_os_error(nix::libc::EINVAL));
     }
@@ -183,6 +202,7 @@ fn write_chunk(dev: &mut PetaicDev, data: &[u8]) -> io::Result<()> {
         tx[..data.len() - 1].copy_from_slice(&data[1..]);
     }
     let mut rx = [0u8; 64];
+    let timeout_ms = bounded_timeout(deadline, 500)?;
     dev.xfer_raw(
         0x00,                        // SC_CMD_WRITE
         0x02,                        // SC_DIR_WRITE
@@ -191,15 +211,19 @@ fn write_chunk(dev: &mut PetaicDev, data: &[u8]) -> io::Result<()> {
         data[0] as u32,
         &tx[..payload_len],
         &mut rx,
-        0,
-        0,
+        1,
+        timeout_ms,
         0,
     )?;
     Ok(())
 }
 
 // Drain one TLS stream chunk from cmd 0x22 reads into `out`. Returns byte count.
-fn read_chunk(dev: &mut PetaicDev, out: &mut [u8]) -> io::Result<usize> {
+fn read_chunk(
+    dev: &mut PetaicDev,
+    out: &mut [u8],
+    deadline: Option<Instant>,
+) -> io::Result<usize> {
     let want = out.len().min(512);
     let rx_cap = (SC_RX_OFF + want + 16).min(PETAIC_READ_CHUNK_MAX) & !7;
     let mut rx = [0u8; PETAIC_READ_CHUNK_MAX];
@@ -211,7 +235,19 @@ fn read_chunk(dev: &mut PetaicDev, out: &mut [u8]) -> io::Result<usize> {
     let mut continuations = 0u32;
 
     loop {
-        let r = dev.xfer_raw(0, 0, 0, 0, 0, &[], &mut rx[..rx_cap], 3, 350, PETAIC_XFER_READ_ONLY);
+        let timeout_ms = bounded_timeout(deadline, 350)?;
+        let r = dev.xfer_raw(
+            0,
+            0,
+            0,
+            0,
+            0,
+            &[],
+            &mut rx[..rx_cap],
+            1,
+            timeout_ms,
+            PETAIC_XFER_READ_ONLY,
+        );
         match r {
             Err(ref e) if e.raw_os_error() == Some(nix::libc::ETIMEDOUT) => return Ok(0),
             Err(e) => return Err(e),
@@ -237,20 +273,24 @@ fn read_chunk(dev: &mut PetaicDev, out: &mut [u8]) -> io::Result<usize> {
 }
 
 // bio_send: fragment a TLS record stream into write_chunk calls.
-fn bio_send(dev: &mut PetaicDev, buf: &[u8]) -> io::Result<()> {
+fn bio_send(
+    dev: &mut PetaicDev,
+    buf: &[u8],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     let mut p = buf;
     while !p.is_empty() {
         if p.len() < 5 {
-            write_chunk(dev, p)?;
+            write_chunk(dev, p, deadline)?;
             break;
         }
         let rlen = ((p[3] as usize) << 8) | p[4] as usize;
-        write_chunk(dev, &p[..5])?;
+        write_chunk(dev, &p[..5], deadline)?;
         p = &p[5..];
         let mut body = rlen.min(p.len());
         while body > 0 {
             let c = body.min(255);
-            write_chunk(dev, &p[..c])?;
+            write_chunk(dev, &p[..c], deadline)?;
             p = &p[c..];
             body -= c;
         }
@@ -396,19 +436,27 @@ fn build_ssl_context(key: [u8; 32]) -> io::Result<SslContext> {
     Ok(b.build())
 }
 
-fn do_accept(ssl: Ssl, bio: TransportBio) -> io::Result<SslStream<TransportBio>> {
+fn do_accept(
+    ssl: Ssl,
+    bio: TransportBio,
+    deadline: Instant,
+) -> io::Result<SslStream<TransportBio>> {
     let mut mid = match ssl.accept(bio) {
         Ok(s) => return Ok(s),
         Err(HandshakeError::WouldBlock(m)) => m,
         Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
     };
-    loop {
+    for _ in 0..HANDSHAKE_MAX_WOULD_BLOCKS {
+        if Instant::now() >= deadline {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
         mid = match mid.handshake() {
             Ok(s) => return Ok(s),
             Err(HandshakeError::WouldBlock(m)) => m,
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         };
     }
+    Err(io::Error::from(io::ErrorKind::TimedOut))
 }
 
 // ---- public Engine ---------------------------------------------------------
@@ -446,6 +494,7 @@ impl Engine {
                 hs_leftover: [0; 512],
                 hs_leftover_len: 0,
                 hs_leftover_off: 0,
+                handshake_deadline: None,
                 session_key: 0,
             }),
             forced_key: None,
@@ -479,7 +528,7 @@ impl Engine {
         self.session = None;
     }
 
-    fn session_handshake(&mut self, key_idx: usize) -> io::Result<()> {
+    fn session_handshake(&mut self, key_idx: usize, deadline: Instant) -> io::Result<()> {
         self.session = None;
         self.shared.session_key = key_idx;
         self.shared.phase = Phase::Handshake;
@@ -495,11 +544,14 @@ impl Engine {
         let ssl = Ssl::new(&ctx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         sc_prelude(&mut self.shared.dev, self.shared.skip_prelude_20)?;
+        self.shared.handshake_deadline = Some(deadline);
 
         // SAFETY: shared is heap-allocated (Box) so the pointer is stable for the
         // lifetime of Engine. session is dropped before shared (field order).
         let ptr = unsafe { NonNull::new_unchecked(&mut *self.shared as *mut EngineShared) };
-        let stream = do_accept(ssl, TransportBio(ptr))?;
+        let result = do_accept(ssl, TransportBio(ptr), deadline);
+        self.shared.handshake_deadline = None;
+        let stream = result?;
 
         if self.shared.verbose {
             eprintln!("[engine] *** HANDSHAKE OK ***");
@@ -512,11 +564,15 @@ impl Engine {
         if self.session.is_some() {
             return Ok(());
         }
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         if let Some(k) = self.forced_key {
-            return self.session_handshake(k);
+            return self.session_handshake(k, deadline);
         }
         for k in 0..PSK_KEYS.len() {
-            if self.session_handshake(k).is_ok() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            if self.session_handshake(k, deadline).is_ok() {
                 return Ok(());
             }
         }
@@ -604,5 +660,19 @@ impl Engine {
     /// Wait for the finger to lift (returns `true`) or for `timeout_ms` to elapse.
     pub fn wait_finger_up(&mut self, timeout_ms: u32) -> bool {
         poll_finger_up(&mut self.shared.dev, timeout_ms)
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn expired_handshake_budget_is_rejected() {
+        let deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            bounded_timeout(Some(deadline), 350).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 }

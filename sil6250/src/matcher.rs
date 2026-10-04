@@ -156,6 +156,11 @@ pub fn best_shift_ncc(
     best_dx: Option<&mut i32>,
     best_dy: Option<&mut i32>,
 ) -> f32 {
+    if max_dx < 0 || max_dy < 0 {
+        return -1.0;
+    }
+    let max_dx = max_dx.min(PM_W as i32 - 1);
+    let max_dy = max_dy.min(PM_H as i32 - 1);
     let mut best = -1.0f32;
     let mut bdx = 0i32;
     let mut bdy = 0i32;
@@ -177,4 +182,21 @@ pub fn best_shift_ncc(
         *p = bdy;
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extreme_shift_bounds_do_not_panic() {
+        let frame = Frame { px: [0.0; PM_N] };
+
+        assert_eq!(
+            best_shift_ncc(&frame, &frame, i32::MAX, i32::MAX, PM_N as i32 + 1, None, None),
+            -1.0
+        );
+        assert_eq!(best_shift_ncc(&frame, &frame, -1, 1, 1, None, None), -1.0);
+        assert_eq!(best_shift_ncc(&frame, &frame, i32::MIN, 1, 1, None, None), -1.0);
+    }
 }

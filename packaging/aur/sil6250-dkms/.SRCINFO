@@ -7,6 +7,7 @@ pkgbase = sil6250-dkms-git
 	license = GPL2
 	makedepends = git
 	depends = dkms
+	install = sil6250-dkms.install
 	provides = sil6250-dkms=0.1.0
 	conflicts = sil6250-dkms
 	source = git+https://github.com/AlexDaichendt/sil6250-linux.git

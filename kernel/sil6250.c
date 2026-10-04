@@ -29,11 +29,13 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #include "sil6250_uapi.h"
 
 #define SIL6250_DRV_NAME "sil6250"
 #define SIL6250_WAIT_DEFAULT_MS	500
+#define SIL6250_WAIT_MAX_MS	30000
 
 struct sil6250 {
 	struct device *dev;
@@ -52,6 +54,10 @@ struct sil6250 {
 	struct completion rx_irq;
 	bool irq_masked;
 	struct mutex irq_lock;
+	atomic_t users;
+	wait_queue_head_t users_wait;
+	struct mutex lifecycle_lock;
+	bool removing;
 
 	struct miscdevice misc;
 };
@@ -218,16 +224,25 @@ static long sil6250_wait_irq(struct sil6250 *s, u32 timeout_ms)
 	long jl;
 	int rc;
 
-	if (s->irq <= 0)
+	if (READ_ONCE(s->removing) || s->irq <= 0)
 		return -ENODEV;
 	if (!timeout_ms)
 		timeout_ms = SIL6250_WAIT_DEFAULT_MS;
+	if (timeout_ms > SIL6250_WAIT_MAX_MS)
+		return -EINVAL;
 
 	rc = mutex_lock_interruptible(&s->irq_lock);
 	if (rc)
 		return rc;
-
+	mutex_lock(&s->lifecycle_lock);
 	reinit_completion(&s->rx_irq);
+	if (READ_ONCE(s->removing)) {
+		mutex_unlock(&s->lifecycle_lock);
+		mutex_unlock(&s->irq_lock);
+		return -ENODEV;
+	}
+	mutex_unlock(&s->lifecycle_lock);
+
 	/* Re-arm the level line. If the EC already staged a packet the line is
 	 * high and the IRQ fires immediately; otherwise we wait for assertion. */
 	if (READ_ONCE(s->irq_masked)) {
@@ -238,6 +253,8 @@ static long sil6250_wait_irq(struct sil6250 *s, u32 timeout_ms)
 					 msecs_to_jiffies(timeout_ms));
 	mutex_unlock(&s->irq_lock);
 
+	if (READ_ONCE(s->removing))
+		return -ENODEV;
 	return jl > 0 ? 0 : -ETIMEDOUT;
 }
 
@@ -245,15 +262,41 @@ static long sil6250_wait_irq(struct sil6250 *s, u32 timeout_ms)
 
 static struct sil6250 *sil6250_from_file(struct file *file)
 {
-	struct miscdevice *m = file->private_data;
+	return file->private_data;
+}
 
-	return container_of(m, struct sil6250, misc);
+static int sil6250_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *m = file->private_data;
+	struct sil6250 *s = container_of(m, struct sil6250, misc);
+
+	mutex_lock(&s->lifecycle_lock);
+	if (s->removing) {
+		mutex_unlock(&s->lifecycle_lock);
+		return -ENODEV;
+	}
+	atomic_inc(&s->users);
+	file->private_data = s;
+	mutex_unlock(&s->lifecycle_lock);
+	return 0;
+}
+
+static int sil6250_release(struct inode *inode, struct file *file)
+{
+	struct sil6250 *s = sil6250_from_file(file);
+
+	if (atomic_dec_and_test(&s->users))
+		wake_up_all(&s->users_wait);
+	return 0;
 }
 
 static long sil6250_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct sil6250 *s = sil6250_from_file(file);
 	void __user *uarg = (void __user *)arg;
+
+	if (READ_ONCE(s->removing))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SIL6250_SET_GPIO: {
@@ -298,6 +341,9 @@ static int sil6250_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct sil6250 *s = sil6250_from_file(file);
 
+	if (READ_ONCE(s->removing))
+		return -ENODEV;
+
 	/* MMIO window: non-cached, and only the window itself is mappable. */
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 	return vm_iomap_memory(vma, s->window_phys, s->window_size);
@@ -310,6 +356,8 @@ static int sil6250_mmap(struct file *file, struct vm_area_struct *vma)
  */
 static const struct file_operations sil6250_fops = {
 	.owner		= THIS_MODULE,
+	.open		= sil6250_open,
+	.release	= sil6250_release,
 	.unlocked_ioctl	= sil6250_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 	.mmap		= sil6250_mmap,
@@ -330,6 +378,9 @@ static int sil6250_probe(struct platform_device *pdev)
 	s->dev = &pdev->dev;
 	init_completion(&s->rx_irq);
 	mutex_init(&s->irq_lock);
+	atomic_set(&s->users, 0);
+	init_waitqueue_head(&s->users_wait);
+	mutex_init(&s->lifecycle_lock);
 	s->irq_masked = true;
 	platform_set_drvdata(pdev, s);
 
@@ -391,11 +442,18 @@ static void sil6250_remove(struct platform_device *pdev)
 	struct sil6250 *s = platform_get_drvdata(pdev);
 
 	misc_deregister(&s->misc);
+	mutex_lock(&s->lifecycle_lock);
+	s->removing = true;
+	complete_all(&s->rx_irq);
+	mutex_unlock(&s->lifecycle_lock);
+	mutex_lock(&s->irq_lock);
 	if (s->irq > 0 && !READ_ONCE(s->irq_masked)) {
 		disable_irq(s->irq);
 		s->irq_masked = true;
 	}
+	mutex_unlock(&s->irq_lock);
 	synchronize_irq(s->irq);
+	wait_event(s->users_wait, atomic_read(&s->users) == 0);
 }
 
 static const struct acpi_device_id sil6250_acpi_ids[] = {

@@ -1,0 +1,16 @@
+_refresh_udev() {
+  udevadm control --reload 2>/dev/null || true
+  udevadm trigger --subsystem-match=misc 2>/dev/null || true
+}
+
+post_install() {
+  _refresh_udev
+}
+
+post_upgrade() {
+  _refresh_udev
+}
+
+post_remove() {
+  udevadm control --reload 2>/dev/null || true
+}

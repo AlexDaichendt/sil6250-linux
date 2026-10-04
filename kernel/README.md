@@ -35,6 +35,8 @@ sudo dkms install sil6250/0.1.0
 
 ## Permissions
 
-Install `60-sil6250.rules` to `/etc/udev/rules.d/` for non-root access to
-`/dev/sil6250` (uaccess ACL for the active session + a `root:users` 0660
-fallback for system services like sil6250d).
+Install `69-sil6250.rules` to `/etc/udev/rules.d/` to restrict `/dev/sil6250`
+to `root`. The root-owned `sil6250d` service is the intended consumer of the
+raw mailbox device; desktop applications communicate with it through
+open-fprintd instead of opening the device directly. Its filename also makes it
+override the legacy `60-sil6250.rules` before systemd applies `uaccess` ACLs.

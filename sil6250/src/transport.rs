@@ -43,7 +43,6 @@ pub const PETAIC_XFER_READ_ONLY: u32 = 1 << 0;
 pub const PETAIC_XFER_NO_IRQ: u32 = 1 << 1;
 
 const NOTIFY_HIGH_MS: u64 = 10;
-const WRITE_POST_MS: u64 = 0;
 const READ_POST_MS: u64 = 20;
 const WAIT_IRQ_DEFAULT_MS: u32 = 500;
 
@@ -109,9 +108,6 @@ impl PetaicDev {
         self.set_gpio(SIL6250_LINE_WRITE_DONE, 1)?;
         sleep(Duration::from_millis(NOTIFY_HIGH_MS));
         self.set_gpio(SIL6250_LINE_WRITE_DONE, 0)?;
-        if WRITE_POST_MS > 0 {
-            sleep(Duration::from_millis(WRITE_POST_MS));
-        }
         Ok(())
     }
 
@@ -284,7 +280,11 @@ impl PetaicDev {
         let tries = if tries == 0 { 1 } else { tries };
         for _ in 0..tries {
             if read_only {
-                let _ = self.wait_irq(timeout_ms);
+                match self.wait_irq(timeout_ms) {
+                    Ok(()) => {}
+                    Err(e) if e.raw_os_error() == Some(nix::libc::ETIMEDOUT) => continue,
+                    Err(e) => return Err(e),
+                }
                 self.shm_read(&mut rx[..read_len])?;
                 if Self::dead_window(&rx[..read_len]) {
                     continue;

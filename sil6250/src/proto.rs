@@ -60,9 +60,12 @@ pub fn build_frame_ex(
     out: &mut [u8],
 ) -> Result<usize, ()> {
     let region_len = payload.len().max(min_region);
-    let inner_len = INNER_HEADER + region_len + CHECKSUM_SIZE;
-    let frame_len = OUTER_HEADER + inner_len;
-    let padded_len = (frame_len + 7) & !7;
+    let inner_len = INNER_HEADER
+        .checked_add(region_len)
+        .and_then(|n| n.checked_add(CHECKSUM_SIZE))
+        .ok_or(())?;
+    let frame_len = OUTER_HEADER.checked_add(inner_len).ok_or(())?;
+    let padded_len = frame_len.checked_add(7).ok_or(())? & !7;
     if padded_len > out.len() {
         return Err(());
     }
@@ -175,4 +178,47 @@ fn parse_inner(inner: &[u8]) -> Option<PetaicFrame<'_>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_round_trip_and_checksum_rejection() {
+        let mut out = [0u8; 128];
+        let n = build_frame_ex(
+            0x14,
+            PETAIT_DIR_OUT,
+            PETAIT_ACCESS_WIDTH_32BIT,
+            &[1, 2, 3],
+            3,
+            0,
+            7,
+            PETAIT_OUTER_TYPE_STD,
+            &mut out,
+        )
+        .unwrap();
+        let parsed = parse_frame(&out[..n]).unwrap();
+        assert_eq!(parsed.cmd, 0x14);
+        assert_eq!(&parsed.payload[..3], &[1, 2, 3]);
+
+        out[OUTER_HEADER + INNER_HEADER] ^= 1;
+        assert!(parse_frame(&out[..n]).is_none());
+    }
+
+    #[test]
+    fn parser_never_panics_on_arbitrary_short_inputs() {
+        let mut seed = 0x9e37_79b9_u32;
+        for len in 0..=4096 {
+            let mut input = vec![0u8; len];
+            for byte in &mut input {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *byte = seed as u8;
+            }
+            let _ = parse_frame(&input);
+        }
+    }
 }

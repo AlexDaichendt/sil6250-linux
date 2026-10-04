@@ -13,8 +13,34 @@ ExecStart=/usr/local/bin/sil6250d
 Environment=SIL6250_DEV=/dev/sil6250
 User=root
 Group=root
-# /dev/sil6250 is a misc char device not on fprintd's default DeviceAllow list.
+UMask=0077
+StateDirectory=open-fprintd/sil6250
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
 DeviceAllow=/dev/sil6250 rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
 Restart=on-failure
 RestartSec=3
 
