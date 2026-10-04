@@ -2,7 +2,6 @@
 name = "sil6250"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
 
 [dependencies]
 openssl = "0.10"

@@ -78,7 +78,7 @@ stage_daemon() {
   fi
 
   log "Building sil6250d (open-fprintd Rust backend)"
-  cargo build --release --manifest-path "$HERE/Cargo.toml" -p sil6250d
+  cargo build --locked --release --manifest-path "$HERE/Cargo.toml" -p sil6250d
 
   log "Installing sil6250d binary -> $PREFIX/bin/sil6250d"
   as_root install -Dm755 "$HERE/target/release/sil6250d" "$PREFIX/bin/sil6250d"
