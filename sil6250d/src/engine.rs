@@ -1,5 +1,6 @@
 use std::io;
 
+use sil6250::PskMode;
 pub use sil6250::{engine::IMG_SIZE, Features, Frame};
 
 pub struct Engine(sil6250::Engine);
@@ -16,6 +17,17 @@ impl Engine {
         // service captures into the journal. Diagnostic only; off by default.
         if std::env::var_os("SIL6250_VERBOSE").is_some() {
             e.set_verbose(true);
+        }
+        // SIL6250_PSK_MODE picks where the TLS PSK comes from:
+        //   auto      (default) provision, fall back to legacy if that fails
+        //   provision push a fresh random key to the sensor before each handshake
+        //   replay    push the key blob captured from the Windows driver
+        //   legacy    no provisioning; firmware fallback key ("shiba") only
+        if let Some(mode) = std::env::var_os("SIL6250_PSK_MODE") {
+            match mode.to_str().and_then(|m| m.parse::<PskMode>().ok()) {
+                Some(m) => e.set_psk_mode(m),
+                None => tracing::warn!(?mode, "unknown SIL6250_PSK_MODE; using auto"),
+            }
         }
         Ok(Engine(e))
     }
