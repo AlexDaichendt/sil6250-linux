@@ -3,6 +3,7 @@
 
 use std::io::{self, Read, Write};
 use std::ptr::NonNull;
+use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -10,15 +11,19 @@ use openssl::ssl::{HandshakeError, Ssl, SslContext, SslContextBuilder, SslMethod
                    SslVerifyMode, SslVersion};
 
 use crate::proto::{
-    checksum, PETAIT_ACCESS_WIDTH_32BIT, PETAIT_CMD_POLL, PETAIT_CMD_TLS_CTRL,
+    checksum, PETAIT_ACCESS_WIDTH_32BIT, PETAIT_CMD_INIT, PETAIT_CMD_KEY_ID,
+    PETAIT_CMD_MODULE_INFO, PETAIT_CMD_POLL, PETAIT_CMD_SET_PSK, PETAIT_CMD_TLS_CTRL,
     PETAIT_CMD_TLS_DATA, PETAIT_DIR_IN, PETAIT_DIR_OUT, PETAIT_OUTER_TYPE_STD,
 };
+use crate::psk;
 use crate::transport::{
     PetaicDev, PETAIC_READ_CHUNK_MAX, PETAIC_XFER_NO_IRQ, PETAIC_XFER_READ_ONLY,
 };
 
 // ---- PSK keys --------------------------------------------------------------
 
+// Firmware fallback keys. A sensor that has never been handed a key (cmd 0x27,
+// see psk.rs) accepts one of these on some units and none of them on others.
 struct PskEntry {
     name: &'static str,
     key: [u8; 32],
@@ -59,6 +64,101 @@ static PSK_KEYS: &[PskEntry] = &[
     },
 ];
 
+/// Where the handshake PSK comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PskMode {
+    /// `Provision`, then `Legacy` if the sensor does not take the key.
+    #[default]
+    Auto,
+    /// Push a fresh random key to the sensor (cmd 0x27) before each handshake.
+    Provision,
+    /// Push the exact blob the Windows driver was traced sending.
+    Replay,
+    /// No provisioning: handshake with the firmware fallback key ring.
+    Legacy,
+}
+
+impl PskMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PskMode::Auto => "auto",
+            PskMode::Provision => "provision",
+            PskMode::Replay => "replay",
+            PskMode::Legacy => "legacy",
+        }
+    }
+}
+
+impl FromStr for PskMode {
+    type Err = io::Error;
+
+    fn from_str(s: &str) -> io::Result<Self> {
+        match s {
+            "auto" => Ok(PskMode::Auto),
+            "provision" => Ok(PskMode::Provision),
+            "replay" => Ok(PskMode::Replay),
+            "legacy" => Ok(PskMode::Legacy),
+            _ => Err(io::Error::from_raw_os_error(nix::libc::EINVAL)),
+        }
+    }
+}
+
+// One handshake attempt: the key to use and, if it has to be pushed to the
+// sensor first, the cmd 0x27 blob carrying it.
+#[derive(Clone)]
+struct KeyPlan {
+    name: &'static str,
+    key: [u8; 32],
+    blob: Option<[u8; psk::PSK_BLOB_LEN]>,
+}
+
+impl KeyPlan {
+    fn ring(idx: usize) -> Self {
+        KeyPlan { name: PSK_KEYS[idx].name, key: PSK_KEYS[idx].key, blob: None }
+    }
+
+    fn provision() -> io::Result<Self> {
+        let (key, blob) = psk::random_blob()?;
+        Ok(KeyPlan { name: "provision", key, blob: Some(blob) })
+    }
+
+    fn replay() -> Self {
+        KeyPlan { name: "replay", key: psk::WINDOWS_KEY, blob: Some(psk::WINDOWS_BLOB) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsDir {
+    HostToSensor,
+    SensorToHost,
+}
+
+/// Everything observed during one handshake attempt, for diagnostics.
+/// The `Vec` fields hold raw mailbox reads (data at offset 7).
+#[derive(Clone, Debug)]
+pub struct HandshakeAttempt {
+    /// `"provision"`, `"replay"`, or the fallback ring key name.
+    pub key_name: &'static str,
+    pub key: [u8; 32],
+    /// The key was pushed to the sensor with cmd 0x27 first.
+    pub provisioned: bool,
+    pub module_info: Option<Vec<u8>>,
+    pub key_id_before: Option<Vec<u8>>,
+    pub set_psk_ack: Option<Vec<u8>>,
+    pub set_psk_acked: bool,
+    pub turn_on_tls: Option<Vec<u8>>,
+    /// Only with [`Engine::set_key_id_readback`].
+    pub key_id_after: Option<Vec<u8>>,
+    /// TLS byte stream as it crossed the mailbox, in order.
+    pub tls: Vec<(TlsDir, Vec<u8>)>,
+    /// PSK identity from the sensor's ClientKeyExchange.
+    pub identity: Option<Vec<u8>>,
+    /// `SHA384(key)[..32]` for a provisioned key.
+    pub expected_identity: Option<[u8; psk::IDENTITY_LEN]>,
+    /// `None` if the handshake completed.
+    pub error: Option<String>,
+}
+
 // ---- image geometry --------------------------------------------------------
 
 pub const IMG_W: usize = 64;
@@ -76,6 +176,13 @@ const IMG_CONT_RETRIES: u32 = 8;
 const CAPTURE_ATTEMPTS: u32 = 6;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDSHAKE_MAX_WOULD_BLOCKS: usize = 64;
+
+// Windows waits ~100 ms before sending the key, up to 500 ms for its ack, and
+// ~150 ms after turning TLS on. Only the provisioning path takes these sleeps.
+const SET_PSK_PRE_MS: u64 = 100;
+const SET_PSK_ACK_MS: u32 = 500;
+const SET_PSK_TLS_ON_MS: u64 = 150;
+const HS_TRACE_MAX: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -101,7 +208,19 @@ struct EngineShared {
     hs_leftover_len: usize,
     hs_leftover_off: usize,
     handshake_deadline: Option<Instant>,
-    session_key: usize,
+    // handshake-phase TLS transcript (diagnostics)
+    hs_trace: Vec<(TlsDir, Vec<u8>)>,
+    hs_trace_len: usize,
+}
+
+impl EngineShared {
+    fn hs_trace_push(&mut self, dir: TlsDir, data: &[u8]) {
+        if self.phase != Phase::Handshake || self.hs_trace_len + data.len() > HS_TRACE_MAX {
+            return;
+        }
+        self.hs_trace_len += data.len();
+        self.hs_trace.push((dir, data.to_vec()));
+    }
 }
 
 // ---- custom BIO ------------------------------------------------------------
@@ -149,6 +268,7 @@ impl Read for TransportBio {
             let mut tmp = [0u8; 512];
             let got = read_chunk(&mut e.dev, &mut tmp, deadline)?;
             if got > 0 {
+                e.hs_trace_push(TlsDir::SensorToHost, &tmp[..got]);
                 e.hs_leftover[..got].copy_from_slice(&tmp[..got]);
                 e.hs_leftover_len = got;
                 let n = got.min(buf.len());
@@ -164,6 +284,7 @@ impl Read for TransportBio {
 impl Write for TransportBio {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let e = unsafe { self.0.as_mut() };
+        e.hs_trace_push(TlsDir::HostToSensor, buf);
         bio_send(&mut e.dev, buf, e.handshake_deadline)?;
         Ok(buf.len())
     }
@@ -300,16 +421,94 @@ fn bio_send(
 
 // ---- handshake prelude -----------------------------------------------------
 
-fn sc_prelude(dev: &mut PetaicDev, skip_20: bool) -> io::Result<()> {
+fn hex(p: &[u8]) -> String {
+    p.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Length of a raw mailbox response carrying `data_len` bytes: 7-byte head,
+// data, 4-byte checksum, qword padding.
+fn resp_len(data_len: usize) -> usize {
+    (SC_RX_OFF + data_len + 4 + 7) & !7
+}
+
+fn read_key_id(dev: &mut PetaicDev) -> Option<Vec<u8>> {
+    let tx = [0u8; 7];
+    let mut rx = [0u8; 256];
+    dev.xfer_raw(PETAIT_CMD_KEY_ID, 0x01, 0x04, 0x13, psk::KEY_ID_LEN as u32, &tx, &mut rx, 0, 0, 0)
+        .ok()
+        .map(|_| rx[..resp_len(psk::KEY_ID_LEN)].to_vec())
+}
+
+// Hand the sensor its PSK (cmd 0x27) and wait for the 0xaa ack.
+fn send_psk(
+    dev: &mut PetaicDev,
+    blob: &[u8; psk::PSK_BLOB_LEN],
+    verbose: bool,
+    att: &mut HandshakeAttempt,
+) -> io::Result<()> {
+    let (be32, payload) = psk::set_psk_args(blob);
+    let mut rx = [0u8; 64];
+    // One try only: a missing ack is the caller's cue to fall back, not to
+    // push the key again.
+    dev.xfer_raw(
+        PETAIT_CMD_SET_PSK, psk::SET_PSK_DIR, psk::SET_PSK_WIDTH, psk::SET_PSK_OUTER, be32,
+        &payload, &mut rx, 1, SET_PSK_ACK_MS, 0,
+    )?;
+    // The level IRQ can fire on the previous transaction's leftover and hand
+    // us that response again; give the real answer one more window.
+    if rx[0] != 0x5a || rx[1] != PETAIT_CMD_SET_PSK {
+        let _ = dev.xfer_raw(0, 0, 0, 0, 0, &[], &mut rx, 1, SET_PSK_ACK_MS, PETAIC_XFER_READ_ONLY);
+    }
+    att.set_psk_ack = Some(rx[..resp_len(1)].to_vec());
+    att.set_psk_acked = psk::is_set_psk_ack(&rx);
+    if verbose {
+        eprintln!(
+            "[engine] cmd 0x27 response {} -> {}",
+            hex(&rx[..resp_len(1)]),
+            if att.set_psk_acked { "acked" } else { "NOT acked" }
+        );
+    }
+    if !att.set_psk_acked {
+        return Err(io::Error::from_raw_os_error(nix::libc::EPROTO));
+    }
+    Ok(())
+}
+
+// 0x20 module info, 0x01, 0x28 key id, [0x27 set PSK], 0x22 "turn on TLS".
+fn sc_prelude(
+    dev: &mut PetaicDev,
+    skip_20: bool,
+    blob: Option<&[u8; psk::PSK_BLOB_LEN]>,
+    verbose: bool,
+    att: &mut HandshakeAttempt,
+) -> io::Result<()> {
     let tx = [0u8; 11];
     let mut rx = [0u8; 256];
-    if !skip_20 {
-        let _ = dev.xfer_raw(0x20, 0x01, 0x04, 0x13, 128, &tx[..7], &mut rx, 0, 0, 0);
+    if !skip_20
+        && dev.xfer_raw(PETAIT_CMD_MODULE_INFO, 0x01, 0x04, 0x13, 128, &tx[..7], &mut rx, 0, 0, 0).is_ok()
+    {
+        att.module_info = Some(rx[..resp_len(128)].to_vec());
     }
     let reg01: &[u8] = &[0x01, 0x08, 0xff, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     let _ = dev.xfer_raw(0x01, 0x00, 0x08, 0x17, 0x08, reg01, &mut rx, 0, 0, 0);
-    let _ = dev.xfer_raw(0x28, 0x01, 0x04, 0x13, 64, &tx[..7], &mut rx, 0, 0, 0);
-    let _ = dev.xfer_raw(0x22, 0x01, 0x04, 0x13, 1, &tx[..7], &mut rx, 0, 0, 0);
+    att.key_id_before = read_key_id(dev);
+    if verbose {
+        // All zeros on a sensor that has not been keyed since power-up.
+        match att.key_id_before.as_deref().and_then(psk::key_id_from_response) {
+            Some(id) => eprintln!("[engine] key id (cmd 0x28): {}", hex(id)),
+            None => eprintln!("[engine] key id (cmd 0x28): no valid response"),
+        }
+    }
+    if let Some(blob) = blob {
+        sleep(Duration::from_millis(SET_PSK_PRE_MS));
+        send_psk(dev, blob, verbose, att)?;
+    }
+    if dev.xfer_raw(0x22, 0x01, 0x04, 0x13, 1, &tx[..7], &mut rx, 0, 0, 0).is_ok() {
+        att.turn_on_tls = Some(rx[..resp_len(1)].to_vec());
+    }
+    if blob.is_some() {
+        sleep(Duration::from_millis(SET_PSK_TLS_ON_MS));
+    }
     Ok(())
 }
 
@@ -418,7 +617,11 @@ fn request_image(dev: &mut PetaicDev) -> io::Result<()> {
 
 // ---- TLS session -----------------------------------------------------------
 
-fn build_ssl_context(key: [u8; 32]) -> io::Result<SslContext> {
+fn build_ssl_context(
+    key: [u8; 32],
+    expected_identity: Option<[u8; psk::IDENTITY_LEN]>,
+    verbose: bool,
+) -> io::Result<SslContext> {
     let mut b = SslContextBuilder::new(SslMethod::tls_server())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     b.set_verify(SslVerifyMode::NONE);
@@ -428,7 +631,21 @@ fn build_ssl_context(key: [u8; 32]) -> io::Result<SslContext> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     b.set_max_proto_version(Some(SslVersion::TLS1_2))
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    b.set_psk_server_callback(move |_ssl, _identity, psk_buf| {
+    b.set_psk_server_callback(move |_ssl, identity, psk_buf| {
+        if verbose {
+            // OpenSSL passes the identity as a C string: it stops at the first
+            // zero byte, so an unkeyed sensor's all-zero identity shows up
+            // empty. A mismatch is only logged; the Finished MAC decides.
+            let id = identity.unwrap_or(&[]);
+            eprintln!("[engine] sensor PSK identity [{}]: {}", id.len(), hex(id));
+            if let Some(want) = &expected_identity {
+                eprintln!(
+                    "[engine] identity {} SHA384(key)[..32] {}",
+                    if psk::cstr_identity_matches(id, want) { "==" } else { "!=" },
+                    hex(want)
+                );
+            }
+        }
         let len = 32.min(psk_buf.len());
         psk_buf[..len].copy_from_slice(&key[..len]);
         Ok(len)
@@ -470,6 +687,11 @@ pub struct Engine {
     session: Option<SslStream<TransportBio>>,
     shared: Box<EngineShared>,
     forced_key: Option<usize>,
+    psk_mode: PskMode,
+    // Auto mode: the sensor did not ack cmd 0x27, stop offering it.
+    provision_refused: bool,
+    key_id_readback: bool,
+    attempts: Vec<HandshakeAttempt>,
 }
 
 // SAFETY: Engine is self-contained and used from one thread at a time.
@@ -495,9 +717,14 @@ impl Engine {
                 hs_leftover_len: 0,
                 hs_leftover_off: 0,
                 handshake_deadline: None,
-                session_key: 0,
+                hs_trace: Vec::new(),
+                hs_trace_len: 0,
             }),
             forced_key: None,
+            psk_mode: PskMode::default(),
+            provision_refused: false,
+            key_id_readback: false,
+            attempts: Vec::new(),
         })
     }
 
@@ -506,7 +733,32 @@ impl Engine {
         self.shared.dev.verbose = v;
     }
 
-    /// Force a specific PSK by name (`"shiba"` etc.); `None` cycles all four.
+    /// With verbose on: dump whole mailbox frames, not just the first 32
+    /// bytes. For diagnostic tools; far too noisy for the daemon's journal.
+    pub fn set_full_dump(&mut self, v: bool) {
+        self.shared.dev.dump_full = v;
+    }
+
+    /// Choose where the handshake PSK comes from (default [`PskMode::Auto`]).
+    pub fn set_psk_mode(&mut self, mode: PskMode) {
+        self.psk_mode = mode;
+        self.provision_refused = false;
+    }
+
+    pub fn psk_mode(&self) -> PskMode {
+        self.psk_mode
+    }
+
+    /// Re-read the key id (cmd 0x28) after every handshake attempt, to see
+    /// whether the sensor took a provisioned key. Diagnostic only: Windows
+    /// never issues this read on a live TLS session, so do not capture on a
+    /// session established with this on.
+    pub fn set_key_id_readback(&mut self, v: bool) {
+        self.key_id_readback = v;
+    }
+
+    /// Force a specific fallback PSK by name (`"shiba"` etc.); `None` cycles
+    /// all four. Applies to [`PskMode::Legacy`] and the legacy leg of `Auto`.
     pub fn set_key(&mut self, name: Option<&str>) -> io::Result<()> {
         match name {
             None => {
@@ -528,36 +780,121 @@ impl Engine {
         self.session = None;
     }
 
-    fn session_handshake(&mut self, key_idx: usize, deadline: Instant) -> io::Result<()> {
+    fn session_handshake(&mut self, plan: &KeyPlan, deadline: Instant) -> io::Result<()> {
         self.session = None;
-        self.shared.session_key = key_idx;
         self.shared.phase = Phase::Handshake;
         self.shared.hs_leftover_len = 0;
         self.shared.hs_leftover_off = 0;
+        self.shared.hs_trace.clear();
+        self.shared.hs_trace_len = 0;
 
-        if self.shared.verbose {
-            eprintln!("[engine] handshake with key '{}'", PSK_KEYS[key_idx].name);
+        let verbose = self.shared.verbose;
+        if verbose {
+            eprintln!(
+                "[engine] handshake with key '{}'{}",
+                plan.name,
+                if plan.blob.is_some() { " (provisioned via cmd 0x27)" } else { "" }
+            );
         }
 
-        let key = PSK_KEYS[key_idx].key;
-        let ctx = build_ssl_context(key)?;
+        let mut att = HandshakeAttempt {
+            key_name: plan.name,
+            key: plan.key,
+            provisioned: plan.blob.is_some(),
+            module_info: None,
+            key_id_before: None,
+            set_psk_ack: None,
+            set_psk_acked: false,
+            turn_on_tls: None,
+            key_id_after: None,
+            tls: Vec::new(),
+            identity: None,
+            expected_identity: plan.blob.map(|_| psk::identity(&plan.key)),
+            error: None,
+        };
+
+        let ctx = build_ssl_context(plan.key, att.expected_identity, verbose)?;
         let ssl = Ssl::new(&ctx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        sc_prelude(&mut self.shared.dev, self.shared.skip_prelude_20)?;
-        self.shared.handshake_deadline = Some(deadline);
+        let prelude = sc_prelude(
+            &mut self.shared.dev,
+            self.shared.skip_prelude_20,
+            plan.blob.as_ref(),
+            verbose,
+            &mut att,
+        );
+        let res = match prelude {
+            Ok(()) => {
+                // SAFETY: shared is heap-allocated (Box) so the pointer is stable for
+                // the lifetime of Engine. session is dropped before shared (field order).
+                let ptr = unsafe { NonNull::new_unchecked(&mut *self.shared as *mut EngineShared) };
+                self.shared.handshake_deadline = Some(deadline);
+                let result = do_accept(ssl, TransportBio(ptr), deadline);
+                self.shared.handshake_deadline = None;
+                result
+            }
+            Err(e) => Err(e),
+        };
 
-        // SAFETY: shared is heap-allocated (Box) so the pointer is stable for the
-        // lifetime of Engine. session is dropped before shared (field order).
-        let ptr = unsafe { NonNull::new_unchecked(&mut *self.shared as *mut EngineShared) };
-        let result = do_accept(ssl, TransportBio(ptr), deadline);
-        self.shared.handshake_deadline = None;
-        let stream = result?;
+        att.tls = std::mem::take(&mut self.shared.hs_trace);
+        let from_sensor: Vec<u8> = att
+            .tls
+            .iter()
+            .filter(|(dir, _)| *dir == TlsDir::SensorToHost)
+            .flat_map(|(_, data)| data.iter().copied())
+            .collect();
+        att.identity = psk::client_psk_identity(&from_sensor);
 
-        if self.shared.verbose {
-            eprintln!("[engine] *** HANDSHAKE OK ***");
+        if self.key_id_readback {
+            att.key_id_after = read_key_id(&mut self.shared.dev);
+            if verbose {
+                let id = att.key_id_after.as_deref().and_then(psk::key_id_from_response);
+                eprintln!(
+                    "[engine] key id readback: {}{}",
+                    id.map_or("no valid response".into(), hex),
+                    match (id, plan.blob) {
+                        (Some(id), Some(_)) if id == psk::key_id_data(&plan.key) =>
+                            " == SHA384(key)",
+                        (Some(_), Some(_)) => " != SHA384(key)",
+                        _ => "",
+                    }
+                );
+            }
         }
-        self.session = Some(stream);
-        Ok(())
+
+        let res = match res {
+            Ok(stream) => {
+                if verbose {
+                    eprintln!("[engine] *** HANDSHAKE OK ***");
+                }
+                self.session = Some(stream);
+                Ok(())
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("[engine] handshake with key '{}' failed: {}", plan.name, e);
+                }
+                att.error = Some(e.to_string());
+                Err(e)
+            }
+        };
+        self.attempts.push(att);
+        res
+    }
+
+    fn legacy_handshake(&mut self, deadline: Instant) -> io::Result<()> {
+        if let Some(k) = self.forced_key {
+            return self.session_handshake(&KeyPlan::ring(k), deadline);
+        }
+        for k in 0..PSK_KEYS.len() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            if self.session_handshake(&KeyPlan::ring(k), deadline).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(io::Error::from_raw_os_error(nix::libc::EIO))
     }
 
     fn session_ensure(&mut self) -> io::Result<()> {
@@ -565,18 +902,60 @@ impl Engine {
             return Ok(());
         }
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        if let Some(k) = self.forced_key {
-            return self.session_handshake(k, deadline);
-        }
-        for k in 0..PSK_KEYS.len() {
-            if Instant::now() >= deadline {
-                return Err(io::Error::from(io::ErrorKind::TimedOut));
+        self.attempts.clear();
+        match self.psk_mode {
+            PskMode::Legacy => self.legacy_handshake(deadline),
+            PskMode::Provision => self.session_handshake(&KeyPlan::provision()?, deadline),
+            PskMode::Replay => self.session_handshake(&KeyPlan::replay(), deadline),
+            PskMode::Auto => {
+                if !self.provision_refused {
+                    // An RNG failure must not cost us the legacy attempt either.
+                    let provisioned = match KeyPlan::provision() {
+                        Ok(plan) => self.session_handshake(&plan, deadline),
+                        Err(e) => Err(e),
+                    };
+                    if provisioned.is_ok() {
+                        return Ok(());
+                    }
+                    // No ack means this firmware does not take cmd 0x27 (or
+                    // choked on it): don't offer it again on this engine. An
+                    // acked key whose handshake then failed may just be a
+                    // flaky handshake, so that is retried next time round.
+                    if self.attempts.last().is_some_and(|a| !a.set_psk_acked) {
+                        self.provision_refused = true;
+                    }
+                    if self.shared.verbose {
+                        eprintln!("[engine] provisioning failed; falling back to legacy keys");
+                    }
+                    // Let the sensor settle; the legacy attempt then restarts
+                    // from a full prelude, exactly as it did before cmd 0x27.
+                    sleep(Duration::from_millis(150));
+                }
+                self.legacy_handshake(deadline)
             }
-            if self.session_handshake(k, deadline).is_ok() {
-                return Ok(());
-            }
         }
-        Err(io::Error::from_raw_os_error(nix::libc::EIO))
+    }
+
+    /// Drop any session and run the prelude + TLS handshake now, without
+    /// waiting for a finger. See [`Engine::handshake_attempts`] for details.
+    pub fn handshake(&mut self) -> io::Result<()> {
+        self.session_drop();
+        self.session_ensure()
+    }
+
+    /// What happened in each attempt of the most recent (re)handshake, in
+    /// order; on success the last entry is the one that completed.
+    pub fn handshake_attempts(&self) -> &[HandshakeAttempt] {
+        &self.attempts
+    }
+
+    /// Firmware version (cmd 0x1b), e.g. `[0, 0, 32, 15]`.
+    pub fn firmware_version(&mut self) -> io::Result<[u8; 4]> {
+        let mut fw = [0u8; 4];
+        self.shared.dev.xfer(
+            PETAIT_CMD_INIT, PETAIT_DIR_OUT, PETAIT_ACCESS_WIDTH_32BIT, &[], &mut fw, 4, 3, 10,
+        )?;
+        Ok(fw)
     }
 
     fn capture_through_session(
@@ -674,5 +1053,80 @@ mod timeout_tests {
             bounded_timeout(Some(deadline), 350).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::ssl::SslConnector;
+    use std::os::unix::net::UnixStream;
+
+    // Records everything the peer sends, like the handshake transcript does.
+    #[derive(Debug)]
+    struct Tap(UnixStream, Vec<u8>);
+
+    impl Read for Tap {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+    }
+
+    impl Write for Tap {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    // Play the sensor: a TLS 1.2 PSK client presenting SHA384(key)[..32].
+    fn sensor(sock: UnixStream, key: [u8; 32]) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            let mut b = SslConnector::builder(SslMethod::tls_client()).unwrap();
+            b.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+            b.set_cipher_list("PSK-AES256-GCM-SHA384").unwrap();
+            b.set_psk_client_callback(move |_ssl, _hint, identity, psk| {
+                identity[..psk::IDENTITY_LEN].copy_from_slice(&psk::identity(&key));
+                identity[psk::IDENTITY_LEN] = 0;
+                psk[..32].copy_from_slice(&key);
+                Ok(32)
+            });
+            let ctx = b.build().into_context();
+            Ssl::new(&ctx).unwrap().connect(sock).is_ok()
+        })
+    }
+
+    #[test]
+    fn provisioned_key_handshake_and_identity() {
+        let (host, dev) = UnixStream::pair().unwrap();
+        let client = sensor(dev, psk::WINDOWS_KEY);
+        let want = psk::identity(&psk::WINDOWS_KEY);
+        let ctx = build_ssl_context(psk::WINDOWS_KEY, Some(want), false).unwrap();
+        let stream = Ssl::new(&ctx).unwrap().accept(Tap(host, Vec::new())).unwrap();
+        assert!(client.join().unwrap());
+        assert_eq!(stream.ssl().current_cipher().unwrap().name(), "PSK-AES256-GCM-SHA384");
+        assert_eq!(psk::client_psk_identity(&stream.get_ref().1).as_deref(), Some(&want[..]));
+    }
+
+    #[test]
+    fn wrong_key_fails_handshake() {
+        let (host, dev) = UnixStream::pair().unwrap();
+        let client = sensor(dev, psk::WINDOWS_KEY);
+        let ctx = build_ssl_context(PSK_KEYS[0].key, None, false).unwrap();
+        assert!(Ssl::new(&ctx).unwrap().accept(Tap(host, Vec::new())).is_err());
+        assert!(!client.join().unwrap());
+    }
+
+    #[test]
+    fn psk_mode_parse() {
+        for m in [PskMode::Auto, PskMode::Provision, PskMode::Replay, PskMode::Legacy] {
+            assert_eq!(m.as_str().parse::<PskMode>().unwrap(), m);
+        }
+        assert!("shiba".parse::<PskMode>().is_err());
+        assert_eq!(PskMode::default(), PskMode::Auto);
     }
 }
