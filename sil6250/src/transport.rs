@@ -54,6 +54,9 @@ pub struct PetaicDev {
     pub window_size: usize,
     seq: u8,
     pub verbose: bool,
+    /// With `verbose`: dump whole frames instead of the first 32 bytes.
+    /// Diagnostic tools only; far too noisy for the daemon's journal.
+    pub dump_full: bool,
 }
 
 // SAFETY: PetaicDev is self-contained; callers ensure no concurrent access.
@@ -89,7 +92,7 @@ impl PetaicDev {
         let window = std::ptr::NonNull::new(window.as_ptr() as *mut u8)
             .ok_or_else(|| std::io::Error::from_raw_os_error(nix::libc::EINVAL))?;
 
-        Ok(PetaicDev { file, window, window_size: size, seq: 0, verbose: false })
+        Ok(PetaicDev { file, window, window_size: size, seq: 0, verbose: false, dump_full: false })
     }
 
     fn set_gpio(&self, line: u32, value: u32) -> std::io::Result<()> {
@@ -170,7 +173,18 @@ impl PetaicDev {
         rx.len() >= 8 && rx[..8].iter().all(|&b| b == 0xff)
     }
 
-    fn dump(tag: &str, p: &[u8]) {
+    fn dump(&self, tag: &str, p: &[u8]) {
+        if self.dump_full {
+            eprintln!("{} [{}]:", tag, p.len());
+            for row in p.chunks(32) {
+                eprint!("   ");
+                for b in row {
+                    eprint!(" {:02x}", b);
+                }
+                eprintln!();
+            }
+            return;
+        }
         let n = p.len().min(32);
         eprint!("{} [{}]:", tag, p.len());
         for b in &p[..n] {
@@ -202,7 +216,7 @@ impl PetaicDev {
         )
         .map_err(|_| std::io::Error::from_raw_os_error(nix::libc::EINVAL))?;
         if self.verbose {
-            Self::dump("TX", &tx[..frame_len]);
+            self.dump("TX", &tx[..frame_len]);
         }
 
         let mut rx = [0u8; PETAIC_READ_CHUNK_MAX];
@@ -214,7 +228,7 @@ impl PetaicDev {
             let read_len = PETAIC_READ_CHUNK_MAX & !7;
             self.shm_read(&mut rx[..read_len])?;
             if self.verbose {
-                Self::dump("RX", &rx[..48.min(read_len)]);
+                self.dump("RX", &rx[..48.min(read_len)]);
             }
             if Self::dead_window(&rx[..read_len]) {
                 continue;
@@ -273,7 +287,7 @@ impl PetaicDev {
             0
         };
         if self.verbose && !read_only {
-            Self::dump("TX-RAW", &tx[..frame_len]);
+            self.dump("TX-RAW", &tx[..frame_len]);
         }
 
         let mut rx = [0u8; PETAIC_READ_CHUNK_MAX];
@@ -290,7 +304,7 @@ impl PetaicDev {
                     continue;
                 }
                 if self.verbose {
-                    Self::dump("RX-RAW(ro)", &rx[..read_len]);
+                    self.dump("RX-RAW(ro)", &rx[..read_len]);
                 }
                 self.strobe_read_done()?;
                 rx_buf[..read_len].copy_from_slice(&rx[..read_len]);
@@ -314,7 +328,7 @@ impl PetaicDev {
                 continue;
             }
             if self.verbose {
-                Self::dump("RX-RAW", &rx[..read_len]);
+                self.dump("RX-RAW", &rx[..read_len]);
             }
             self.strobe_read_done()?;
             rx_buf[..read_len].copy_from_slice(&rx[..read_len]);
