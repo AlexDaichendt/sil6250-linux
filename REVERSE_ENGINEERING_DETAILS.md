@@ -22,7 +22,8 @@ _audit_, or _extend_ it.
   resources and nothing else.
 - All command framing, a **TLS-PSK secure channel**, and the **image capture
   loop** live in userspace (`sil6250/`, the Rust library). The PSK ring was recovered
-  from the Windows service binary; this unit uses the key `shiba`.
+  from the Windows service binary, but the host really pushes its own PSK to the
+  sensor (cmd `0x27`, §5); the ring is only a firmware fallback.
 - The sensor is **Match-on-Host**: it streams raw 64×80 images and does _no_
   matching itself. There is **no firmware calibration** — the raw frame is
   byte-identical to what Windows captures (I think, kinda hard to test).
@@ -276,17 +277,48 @@ dog-breed names. The ring was recovered two ways that agreed byte-for-byte:
 | `chihuahua`    | `587d3f962e3d7ea1f08c0fb79c03784d9fec2d1f97f76c7f5d2f66ed432d9fe9` |
 | `bordercollie` | `10585a35ac1e78ce4f308de7352dd1af62539500dbe71be215d7ab51ae9fe340` |
 
-These are **identical on every unit running this driver build**, so the Linux
-stack hardcodes all four and lets the handshake select the right one. On a fresh
-/unprovisioned unit the sensor presents an **all-zero 32-byte identity**, so the
-strategy is: register all four keys, and the one whose client Finished MAC
-verifies is the one in use. On this hardware that is **`shiba`** — confirmed
-_cryptographically_ by a completing handshake, not by guesswork.
+**Correction (2026-10):** these four keys are *not* what the Windows driver
+uses for TLS. Nothing in `PetaicTouchFP.dll` references the ring; the same
+`shiba` record sits inside sensor firmware images, so the ring is firmware-side
+material. `shiba` is merely the **fallback PSK** this unit's firmware uses while
+it has not been handed a key. Other units reject all four ring keys while
+presenting the same all-zero identity (issues #11, #12); presumably their
+firmware falls back to a different key.
 
-Note the identity is a _key-id label_ (derived as `SHA384(provisioning-random)`
-truncated to 32 bytes) and is independent of which PSK the sensor holds — a
-subtlety that initially looked like "the dog name should appear on the wire" but
-doesn't.
+### What Windows actually does: provision the PSK (cmd `0x27`)
+
+Before every first handshake the host **pushes its own 32-byte PSK** to the
+sensor, in the clear, and then handshakes with it:
+
+```
+0x28  read 64-byte key id          (all zeros = sensor not keyed)
+0x27  write 128-byte key blob      -> ack 5a 27 06 01 00 00 00 aa
+0x22  read 1 byte (0x5a)           "turn on TLS"
+TLS handshake, PSK = the pushed key
+```
+
+The blob is obfuscation, not cryptography — an 8-byte salt and two fixed XORs,
+no secret, no MAC (`sil6250/src/psk.rs`):
+
+```
+blob[1 + 2*i]  = salt[i] ^ 0x86                 i in 0..8
+blob[0x40 + i] = key[i] ^ salt[i % 8] ^ 0x39    i in 0..32
+everything else = random filler
+```
+
+Once keyed, the sensor's key id (cmd `0x28`) is `SHA384(key)` + 16 zero bytes
+and its ClientKeyExchange identity is `SHA384(key)[:32]`. The Windows driver
+fills key and salt from `rand()` without ever calling `srand`, so its first key
+is always `529049f1…8ba6` — the traced frame is reproduced byte-for-byte from
+seed 1.
+
+Confirmed on hardware (fw 0.0.32.15): an unkeyed sensor accepts `0x27`; fresh
+random keys and re-keying work; the key persists across sessions; a keyed
+sensor no longer accepts `shiba`; and a **failed handshake resets the sensor to
+unkeyed** (key id back to zeros), after which the fallback key works again.
+
+The engine therefore provisions a fresh random key per handshake and only falls
+back to the ring if the sensor refuses (`PskMode::Auto`).
 
 The production path is `sil6250/src/engine.rs` (OpenSSL server BIOs wrapping
 the mailbox transport).
@@ -622,6 +654,6 @@ worked in the lab.
   `median_quantizationLocal` preprocessing) is recovered but not yet ported; it
   is the highest-effort remaining lever if the capture-side gates ever prove
   insufficient.
-- **PSK rotation risk**: the four keys are constants in this driver build and are
-  identical across units, but a future firmware/driver revision could ship a
-  different ring (cheap to re-extract if so).
+- **Firmware fallback keys differ between units** (§5). The driver no longer
+  depends on them — it provisions its own PSK — but provisioning is so far only
+  proven on firmware 0.0.32.15.

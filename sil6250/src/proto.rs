@@ -5,7 +5,10 @@ pub const PETAIT_CMD_BULK: u8 = 0x00;
 pub const PETAIT_CMD_POLL: u8 = 0x11;
 pub const PETAIT_CMD_GET_SENSOR_INFO: u8 = 0x14;
 pub const PETAIT_CMD_INIT: u8 = 0x1b;
+pub const PETAIT_CMD_MODULE_INFO: u8 = 0x20;
 pub const PETAIT_CMD_READ_STREAM: u8 = 0x22;
+pub const PETAIT_CMD_SET_PSK: u8 = 0x27;
+pub const PETAIT_CMD_KEY_ID: u8 = 0x28;
 pub const PETAIT_CMD_TLS_CTRL: u8 = 0x37;
 pub const PETAIT_CMD_TLS_DATA: u8 = 0x38;
 

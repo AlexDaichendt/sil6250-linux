@@ -4,10 +4,11 @@
 pub mod engine;
 pub mod matcher;
 pub mod proto;
+pub mod psk;
 pub mod sift;
 pub mod transport;
 
-pub use engine::{Engine, IMG_H, IMG_SIZE, IMG_W};
+pub use engine::{Engine, HandshakeAttempt, PskMode, TlsDir, IMG_H, IMG_SIZE, IMG_W};
 pub use matcher::Frame;
 pub use sift::Features;
 
