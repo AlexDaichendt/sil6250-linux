@@ -177,7 +177,7 @@ fn main() -> ExitCode {
         match engine.firmware_version() {
             Ok(v) => println!(
                 "firmware version (cmd 0x1b): {}.{}.{}.{} (raw {})",
-                v[0], v[1], v[2], v[3], hex(&v)
+                v[3], v[2], v[1], v[0], hex(&v)
             ),
             Err(e) => println!("firmware version (cmd 0x1b): no answer ({e})"),
         }
