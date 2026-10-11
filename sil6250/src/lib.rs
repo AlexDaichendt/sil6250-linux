@@ -4,6 +4,7 @@
 pub mod engine;
 pub mod matcher;
 pub mod proto;
+pub mod psk;
 pub mod sift;
 pub mod transport;
 
