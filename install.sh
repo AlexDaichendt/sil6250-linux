@@ -75,6 +75,9 @@ stage_daemon() {
     warn "open-fprintd does not appear to be installed (no open-fprintd.service)."
     warn "sil6250d registers with open-fprintd over D-Bus; without it fprintd-enroll"
     warn "will find no device. Install open-fprintd first (see README), then re-run."
+    warn "Note: a source install of open-fprintd must also install its systemd unit"
+    warn "(debian/open-fprintd.service); setup.py omits it and D-Bus activation then"
+    warn "fails on systemd distros. See docs/ubuntu.md."
   fi
 
   log "Building sil6250d (open-fprintd Rust backend)"
