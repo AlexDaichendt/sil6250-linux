@@ -54,6 +54,10 @@ tracked and uninstallable with `pacman -R sil6250d sil6250-dkms`. These are VCS
 
 ### Other distros: `install.sh`
 
+> **Debian / Ubuntu:** see [`docs/ubuntu.md`](docs/ubuntu.md) for exact steps —
+> the build dependencies, installing `open-fprintd` from source (including the
+> systemd unit its `setup.py` omits), DKMS, and enabling PAM.
+
 Use an up-to-date stable Rust toolchain to build the daemon. The compiler
 packaged by your distribution may be too old for the locked dependencies;
 [rustup](https://rust-lang.org/tools/install/) is the recommended way to obtain
