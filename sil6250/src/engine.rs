@@ -17,7 +17,7 @@ use crate::proto::{
 };
 use crate::psk;
 use crate::transport::{
-    PetaicDev, PETAIC_READ_CHUNK_MAX, PETAIC_XFER_NO_IRQ, PETAIC_XFER_READ_ONLY,
+    slept_error, PetaicDev, PETAIC_READ_CHUNK_MAX, PETAIC_XFER_NO_IRQ, PETAIC_XFER_READ_ONLY,
 };
 
 // ---- PSK keys --------------------------------------------------------------
@@ -573,7 +573,7 @@ fn img_pull_record(e: &mut EngineShared) -> io::Result<()> {
 
 fn poll_finger(dev: &mut PetaicDev, timeout_ms: u32) -> bool {
     let mut waited = 0u32;
-    while waited < timeout_ms {
+    while waited < timeout_ms && !dev.slept() {
         let mut st = [0xffu8];
         if dev
             .xfer(PETAIT_CMD_POLL, PETAIT_DIR_OUT, PETAIT_ACCESS_WIDTH_32BIT, &[], &mut st, 1, 2, 10)
@@ -590,7 +590,7 @@ fn poll_finger(dev: &mut PetaicDev, timeout_ms: u32) -> bool {
 
 fn poll_finger_up(dev: &mut PetaicDev, timeout_ms: u32) -> bool {
     let mut waited = 0u32;
-    while waited < timeout_ms {
+    while waited < timeout_ms && !dev.slept() {
         let mut st = [0xffu8];
         if dev
             .xfer(PETAIT_CMD_POLL, PETAIT_DIR_OUT, PETAIT_ACCESS_WIDTH_32BIT, &[], &mut st, 1, 2, 10)
@@ -776,6 +776,13 @@ impl Engine {
         }
     }
 
+    /// Whether the system has suspended or hibernated since this engine was
+    /// opened. The sensor loses its state across sleep, so every operation on
+    /// this engine now fails with `ESTALE`; open a new one.
+    pub fn slept(&self) -> bool {
+        self.shared.dev.slept()
+    }
+
     fn session_drop(&mut self) {
         self.session = None;
     }
@@ -890,6 +897,9 @@ impl Engine {
             if Instant::now() >= deadline {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
+            if self.shared.dev.slept() {
+                return Err(slept_error());
+            }
             if self.session_handshake(&KeyPlan::ring(k), deadline).is_ok() {
                 return Ok(());
             }
@@ -916,6 +926,11 @@ impl Engine {
                     };
                     if provisioned.is_ok() {
                         return Ok(());
+                    }
+                    // Interrupted by a suspend: says nothing about the
+                    // firmware, and no key can work until the device reopens.
+                    if self.shared.dev.slept() {
+                        return Err(slept_error());
                     }
                     // No ack means this firmware does not take cmd 0x27 (or
                     // choked on it): don't offer it again on this engine. An
@@ -1010,13 +1025,24 @@ impl Engine {
     ///
     /// Waits up to `finger_ms` for a finger, lazily (re)establishes the TLS
     /// session, and retries on a desynced GCM stream.
+    ///
+    /// Fails with `ESTALE` once the system has slept since [`Engine::open`]:
+    /// the sensor has lost its state, so open a new engine.
     pub fn capture_frame(&mut self, finger_ms: u32) -> io::Result<[u8; IMG_SIZE]> {
         let mut img = [0u8; IMG_SIZE];
         for attempt in 0..CAPTURE_ATTEMPTS {
+            if self.slept() {
+                self.session_drop();
+                return Err(slept_error());
+            }
             self.session_ensure()?;
             let fm = if attempt == 0 { finger_ms } else { 3000 };
             match self.capture_through_session(&mut img, fm) {
                 Ok(()) => return Ok(img),
+                Err(_) if self.slept() => {
+                    self.session_drop();
+                    return Err(slept_error());
+                }
                 Err(ref e) if e.raw_os_error() == Some(nix::libc::ETIMEDOUT) && attempt == 0 => {
                     return Err(io::Error::from_raw_os_error(nix::libc::ETIMEDOUT));
                 }

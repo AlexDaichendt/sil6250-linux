@@ -1,14 +1,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::{Mutex, MutexGuard, Notify};
+use tokio::sync::{Mutex, MutexGuard};
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::engine::{Engine, Features, Frame};
 use crate::storage;
 
 const ENROLL_STAGES: u32 = 15;
-const FINGER_MS: u32 = 15_000;
+/// How long one capture call waits for a finger. The loops just call again on
+/// timeout, so this only bounds how quickly they notice cancellation or sleep.
+const POLL_SLICE_MS: u32 = 500;
 const LIFT_MS: u32 = 4_000;
 const MAX_SHIFT: i32 = 14;
 const MIN_OVERLAP: i32 = 1200;
@@ -16,24 +19,20 @@ const ENROLL_MAX_NCC: f32 = 0.85;
 const ENROLL_MAX_REDUNDANT: u32 = ENROLL_STAGES * 4;
 const QUALITY_MIN: f32 = 0.52;
 const SIFT_THRESHOLD: i32 = 5;
+/// Attempts (and the delay between them) to reopen the sensor after a sleep.
+const REOPEN_ATTEMPTS: u32 = 5;
+const REOPEN_DELAY: Duration = Duration::from_millis(500);
 
 pub const OBJECT_PATH: &str = "/io/github/uunicorn/Fprint/Device";
 
-#[derive(Default)]
-struct State {
-    suspended: bool,
-}
-
 pub struct DeviceService {
     devpath: String,
-    state: Arc<Mutex<State>>,
     /// Cancellation flag of the operation currently running, if any.
     current: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     /// Serializes access to the sensor. The engine drives a single MMIO mailbox
     /// and one pair of strobe GPIOs, so two engines open on `/dev/sil6250` at
     /// once corrupt each other's frames and no TLS handshake ever completes.
     dev_lock: Arc<Mutex<()>>,
-    resume_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -63,10 +62,8 @@ impl DeviceService {
     pub fn new(devpath: String) -> Self {
         DeviceService {
             devpath,
-            state: Arc::default(),
             current: Arc::default(),
             dev_lock: Arc::default(),
-            resume_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -119,10 +116,6 @@ impl DeviceService {
         username: &str,
         finger_name: &str,
     ) -> zbus::fdo::Result<()> {
-        if self.state.lock().await.suspended {
-            return Err(zbus::fdo::Error::Failed("suspended".into()));
-        }
-
         let operation = self.begin_op().await;
         let dev_lock = Arc::clone(&self.dev_lock);
 
@@ -253,14 +246,17 @@ impl DeviceService {
         Ok(())
     }
 
+    // Sent by open-fprintd's optional suspend/resume units, and too late to
+    // act on: open-fprintd-suspend runs alongside the suspend, not before it.
+    // The capture loops notice a sleep themselves (Engine::slept) and reopen
+    // the sensor. Cancelling here would strand a client mid-verify, such as
+    // pam_fprintd in a lock screen, until its own timeout.
     async fn suspend(&self) {
-        self.state.lock().await.suspended = true;
-        self.cancel_current().await;
+        tracing::debug!("suspend requested");
     }
 
     async fn resume(&self) {
-        self.state.lock().await.suspended = false;
-        self.resume_notify.notify_waiters();
+        tracing::debug!("resume requested");
     }
 
     async fn run_cmd(&self, _cmd: &str) -> zbus::fdo::Result<String> {
@@ -287,6 +283,34 @@ impl DeviceService {
     async fn verify_finger_selected(emitter: &SignalEmitter<'_>, finger: &str) -> zbus::Result<()>;
 }
 
+/// Open a fresh engine after the system slept under the old one.
+///
+/// The sensor loses its state (TLS session included) across suspend/hibernate.
+/// The running operation carries on with the new engine, so a client waiting
+/// on it, such as pam_fprintd in a lock screen, never notices the sleep.
+fn reopen_after_sleep(devpath: &str, operation: &Operation) -> anyhow::Result<Engine> {
+    tracing::debug!("system slept; reopening the sensor");
+    let mut attempt = 1;
+    loop {
+        if operation.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        match Engine::open(devpath) {
+            Ok(engine) => {
+                tracing::info!(attempt, "sensor reopened after sleep");
+                return Ok(engine);
+            }
+            // The device can take a moment to come back after resume.
+            Err(e) if attempt < REOPEN_ATTEMPTS => {
+                tracing::debug!(attempt, "reopening the sensor failed: {e}");
+                std::thread::sleep(REOPEN_DELAY);
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 fn enroll_blocking(
     devpath: &str,
     username: &str,
@@ -306,11 +330,14 @@ fn enroll_blocking(
         if operation.is_cancelled() {
             anyhow::bail!("cancelled");
         }
+        if engine.slept() {
+            engine = reopen_after_sleep(devpath, operation)?;
+        }
 
         // Single capture per presentation; classify quality ourselves rather
         // than letting capture() force a low-quality frame through on its last
         // retry. No finger / unusable read just keeps waiting for a press.
-        let Some((frame, _raw)) = engine.capture(FINGER_MS, 0.0, 0) else {
+        let Some((frame, _raw)) = engine.capture(POLL_SLICE_MS, 0.0, 0) else {
             continue;
         };
 
@@ -411,10 +438,13 @@ fn verify_blocking(
         if operation.is_cancelled() {
             anyhow::bail!("cancelled");
         }
+        if engine.slept() {
+            engine = reopen_after_sleep(devpath, operation)?;
+        }
 
         // quality_min = 0, max_retry = 0: take a single frame and classify the
         // scan ourselves rather than letting capture() silently re-prompt.
-        let Some((frame, _raw)) = engine.capture(FINGER_MS, 0.0, 0) else {
+        let Some((frame, _raw)) = engine.capture(POLL_SLICE_MS, 0.0, 0) else {
             // No finger or an unusable read this round — keep waiting for a press.
             continue;
         };
@@ -492,5 +522,15 @@ mod operation_tests {
         drop(publication);
         cancellation.await;
         assert!(operation.lock_current().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn suspend_keeps_operation_alive() {
+        let service = DeviceService::new(String::new());
+        let operation = service.begin_op().await;
+        service.suspend().await;
+        service.resume().await;
+        assert!(!operation.is_cancelled());
+        assert!(operation.lock_current().await.is_some());
     }
 }
