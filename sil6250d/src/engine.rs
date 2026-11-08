@@ -60,4 +60,10 @@ impl Engine {
     pub fn wait_finger_up(&mut self, timeout_ms: u32) -> bool {
         self.0.wait_finger_up(timeout_ms)
     }
+
+    /// Whether the system has slept since this engine was opened, leaving the
+    /// sensor without its state. Every capture fails until it is reopened.
+    pub fn slept(&self) -> bool {
+        self.0.slept()
+    }
 }

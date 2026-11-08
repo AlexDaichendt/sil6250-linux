@@ -45,6 +45,28 @@ pub const PETAIC_XFER_NO_IRQ: u32 = 1 << 1;
 const NOTIFY_HIGH_MS: u64 = 10;
 const READ_POST_MS: u64 = 20;
 const WAIT_IRQ_DEFAULT_MS: u32 = 500;
+/// Growth of the sleep offset that counts as a suspend. Reading the two clocks
+/// is not atomic, so allow for jitter; no real suspend is this short.
+const SLEPT_SLACK: Duration = Duration::from_millis(100);
+
+/// Time the system has spent suspended or hibernated since boot:
+/// CLOCK_BOOTTIME keeps counting across sleep, CLOCK_MONOTONIC does not.
+fn sleep_offset() -> Duration {
+    fn now(clock: nix::libc::clockid_t) -> Duration {
+        let mut ts = nix::libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // Both clocks always exist on Linux; this cannot fail.
+        unsafe { nix::libc::clock_gettime(clock, &mut ts) };
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+    now(nix::libc::CLOCK_BOOTTIME).saturating_sub(now(nix::libc::CLOCK_MONOTONIC))
+}
+
+/// The error every transaction returns once the system has slept since the
+/// device was opened. The sensor loses its state (TLS session included) across
+/// suspend/hibernate, so the caller must open the device again.
+pub fn slept_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(nix::libc::ESTALE)
+}
 
 // ---- device ----------------------------------------------------------------
 
@@ -57,6 +79,8 @@ pub struct PetaicDev {
     /// With `verbose`: dump whole frames instead of the first 32 bytes.
     /// Diagnostic tools only; far too noisy for the daemon's journal.
     pub dump_full: bool,
+    /// `sleep_offset()` when the device was opened.
+    sleep_mark: Duration,
 }
 
 // SAFETY: PetaicDev is self-contained; callers ensure no concurrent access.
@@ -92,7 +116,28 @@ impl PetaicDev {
         let window = std::ptr::NonNull::new(window.as_ptr() as *mut u8)
             .ok_or_else(|| std::io::Error::from_raw_os_error(nix::libc::EINVAL))?;
 
-        Ok(PetaicDev { file, window, window_size: size, seq: 0, verbose: false, dump_full: false })
+        Ok(PetaicDev {
+            file,
+            window,
+            window_size: size,
+            seq: 0,
+            verbose: false,
+            dump_full: false,
+            sleep_mark: sleep_offset(),
+        })
+    }
+
+    /// Whether the system has suspended or hibernated since the device was
+    /// opened. Once it has, every transaction fails with [`slept_error`].
+    pub fn slept(&self) -> bool {
+        sleep_offset() > self.sleep_mark + SLEPT_SLACK
+    }
+
+    fn check_awake(&self) -> std::io::Result<()> {
+        if self.slept() {
+            return Err(slept_error());
+        }
+        Ok(())
     }
 
     fn set_gpio(&self, line: u32, value: u32) -> std::io::Result<()> {
@@ -222,6 +267,7 @@ impl PetaicDev {
         let mut rx = [0u8; PETAIC_READ_CHUNK_MAX];
         let tries = if tries == 0 { 1 } else { tries };
         for _ in 0..tries {
+            self.check_awake()?;
             self.shm_write(&tx[..frame_len])?;
             self.strobe_write_done()?;
             sleep(Duration::from_millis(if timeout_ms == 0 { 10 } else { timeout_ms as u64 }));
@@ -293,6 +339,7 @@ impl PetaicDev {
         let mut rx = [0u8; PETAIC_READ_CHUNK_MAX];
         let tries = if tries == 0 { 1 } else { tries };
         for _ in 0..tries {
+            self.check_awake()?;
             if read_only {
                 match self.wait_irq(timeout_ms) {
                     Ok(()) => {}
@@ -345,6 +392,19 @@ impl Drop for PetaicDev {
                 std::ptr::NonNull::new(self.window.as_ptr() as *mut _).unwrap(),
                 self.window_size,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_offset_is_steady_while_awake() {
+        let before = sleep_offset();
+        for _ in 0..1000 {
+            assert!(sleep_offset() <= before + SLEPT_SLACK);
         }
     }
 }
